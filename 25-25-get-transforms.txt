@@ -1,0 +1,85 @@
+# dataset.py
+import torch
+from torch.utils.data import DataLoader, Subset, random_split
+from torchvision import datasets, transforms
+from typing import Tuple
+import os
+from config import MLPConfig
+
+
+def get_transforms(dataset_name: str, train: bool) -> transforms.Compose:
+    """
+    Return dataset-specific transforms.
+    Normalization stats are precomputed per dataset.
+    """
+    if dataset_name == "mnist":
+        transform_list = [transforms.ToTensor()]
+        if train:
+            transform_list.append(transforms.RandomAffine(degrees=10, translate=(0.1, 0.1)))
+        transform_list.append(transforms.Normalize((0.1307,), (0.3081,)))
+        transform_list.append(transforms.Lambda(lambda x: x.view(-1)))  # flatten
+        return transforms.Compose(transform_list)
+
+    elif dataset_name == "cifar10":
+        transform_list = [transforms.ToTensor()]
+        if train:
+            transform_list += [
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomCrop(32, padding=4),
+            ]
+        transform_list.append(
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
+        )
+        transform_list.append(transforms.Lambda(lambda x: x.view(-1)))  # flatten
+        return transforms.Compose(transform_list)
+
+    else:
+        raise ValueError(f"Unsupported dataset '{dataset_name}'. Use 'mnist' or 'cifar10'.")
+
+
+def load_datasets(config: MLPConfig) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """
+    Build train / validation / test DataLoaders.
+
+    Returns:
+        train_loader, val_loader, test_loader
+    """
+    os.makedirs(config.data_dir, exist_ok=True)
+
+    # ── Select dataset class ──────────────────────────────────────
+    dataset_cls = {
+        "mnist":   datasets.MNIST,
+        "cifar10": datasets.CIFAR10,
+    }.get(config.dataset)
+
+    if dataset_cls is None:
+        raise ValueError(f"Dataset '{config.dataset}' not supported.")
+
+    # ── Load raw splits ───────────────────────────────────────────
+    train_transform = get_transforms(config.dataset, train=True)
+    test_transform  = get_transforms(config.dataset, train=False)
+
+    full_train = dataset_cls(config.data_dir, train=True,  transform=train_transform, download=True)
+    test_set   = dataset_cls(config.data_dir, train=False, transform=test_transform,  download=True)
+
+    # ── Train / val split ─────────────────────────────────────────
+    val_size   = int(len(full_train) * config.val_split)
+    train_size = len(full_train) - val_size
+
+    # Use fixed generator for reproducibility
+    generator = torch.Generator().manual_seed(config.seed)
+    train_set, val_set = random_split(full_train, [train_size, val_size], generator=generator)
+
+    # ── Build loaders ─────────────────────────────────────────────
+    loader_kwargs = dict(
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        pin_memory=True,         # speeds up CPU→GPU transfer
+    )
+
+    train_loader = DataLoader(train_set, shuffle=True,  **loader_kwargs)
+    val_loader   = DataLoader(val_set,   shuffle=False, **loader_kwargs)
+    test_loader  = DataLoader(test_set,  shuffle=False, **loader_kwargs)
+
+    print(f"[Dataset] Train: {len(train_set):,} | Val: {len(val_set):,} | Test: {len(test_set):,}")
+    return train_loader, val_loader, test_loader

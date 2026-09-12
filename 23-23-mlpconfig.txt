@@ -1,0 +1,49 @@
+# config.py
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+
+@dataclass
+class MLPConfig:
+    """
+    Central configuration for MLP training.
+    All hyperparameters live here — no magic numbers scattered in code.
+    """
+
+    # ── Architecture ──────────────────────────────────────────────
+    input_dim: int = 784            # e.g. 28x28 flattened MNIST
+    hidden_dims: List[int] = field(default_factory=lambda: [512, 256, 128])
+    output_dim: int = 10            # number of classes
+    dropout_rate: float = 0.3       # dropout probability (0 = disabled)
+    use_batch_norm: bool = True     # batch normalization between layers
+    activation: str = "relu"        # "relu" | "gelu" | "leaky_relu" | "tanh"
+
+    # ── Training ──────────────────────────────────────────────────
+    epochs: int = 50
+    batch_size: int = 128
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-4      # L2 regularization
+    grad_clip: float = 1.0          # max gradient norm (0 = disabled)
+
+    # ── Scheduler ─────────────────────────────────────────────────
+    scheduler: str = "cosine"       # "cosine" | "step" | "plateau" | "none"
+    warmup_epochs: int = 5          # linear warmup before main schedule
+    step_size: int = 10             # for StepLR
+    gamma: float = 0.5              # for StepLR / ReduceLROnPlateau
+
+    # ── Data ──────────────────────────────────────────────────────
+    dataset: str = "mnist"          # "mnist" | "cifar10" | "custom"
+    data_dir: str = "./data"
+    val_split: float = 0.1          # fraction of train data used for validation
+    num_workers: int = 4
+
+    # ── Checkpointing & Logging ───────────────────────────────────
+    checkpoint_dir: str = "./checkpoints"
+    log_dir: str = "./logs"
+    save_best_only: bool = True
+    early_stopping_patience: int = 10   # 0 = disabled
+    log_interval: int = 50              # log every N batches
+
+    # ── Reproducibility ───────────────────────────────────────────
+    seed: int = 42
+    device: str = "auto"            # "auto" | "cpu" | "cuda" | "mps"

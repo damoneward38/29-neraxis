@@ -1,0 +1,120 @@
+/**
+ * Manages file system operations for scene captures
+ */
+const fs = require("fs").promises;
+const path = require("path");
+
+class StorageManager {
+  /**
+   * @param {object} config - Storage configuration section
+   */
+  constructor(config) {
+    this.config = config;
+  }
+
+  /**
+   * Resolve the target directory, creating it if needed
+   * @returns {Promise<string>} Absolute directory path
+   */
+  async resolveOutputDir() {
+    let dir = path.resolve(this.config.outputDir);
+
+    // Optionally organize captures into date-based subdirectories
+    if (this.config.organizeByDate) {
+      const now = new Date();
+      const datePath = [
+        now.getFullYear(),
+        String(now.getMonth() + 1).padStart(2, "0"),
+        String(now.getDate()).padStart(2, "0"),
+      ].join("/");
+
+      dir = path.join(dir, datePath);
+    }
+
+    // Ensure directory exists (recursive creation)
+    await fs.mkdir(dir, { recursive: true });
+    return dir;
+  }
+
+  /**
+   * Save image buffer to disk
+   * @param {Buffer} buffer - Image data
+   * @param {string} filename - Target filename
+   * @returns {Promise<string>} Full file path of saved image
+   */
+  async saveImage(buffer, filename) {
+    const dir = await this.resolveOutputDir();
+    const filePath = path.join(dir, filename);
+
+    await fs.writeFile(filePath, buffer);
+    return filePath;
+  }
+
+  /**
+   * Save metadata as a JSON file alongside the image
+   * @param {object} metadata - Metadata object
+   * @param {string} imagePath - Corresponding image file path
+   * @returns {Promise<string>} Full path of metadata file
+   */
+  async saveMetadata(metadata, imagePath) {
+    // Replace image extension with .json
+    const metaPath = imagePath.replace(/\.[^.]+$/, ".meta.json");
+
+    await fs.writeFile(
+      metaPath,
+      JSON.stringify(metadata, null, 2),   // Pretty-print for readability
+      "utf8"
+    );
+
+    return metaPath;
+  }
+
+  /**
+   * Check current storage usage and warn if limit is approached
+   * @returns {Promise<number>} Used storage in bytes
+   */
+  async checkStorageUsage() {
+    const dir = path.resolve(this.config.outputDir);
+
+    try {
+      const files = await this._getFilesRecursive(dir);
+      const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+      const limitBytes = this.config.maxStorageGB * 1024 ** 3;
+
+      // Warn when storage exceeds 80% of configured limit
+      if (totalBytes > limitBytes * 0.8) {
+        console.warn(
+          `⚠️  Storage usage at ${((totalBytes / limitBytes) * 100).toFixed(1)}%`
+        );
+      }
+
+      return totalBytes;
+    } catch {
+      return 0; // Return 0 if directory doesn't exist yet
+    }
+  }
+
+  /**
+   * Recursively collect file stats from a directory
+   * @param {string} dir - Directory to scan
+   * @returns {Promise<Array<{path: string, size: number}>>}
+   */
+  async _getFilesRecursive(dir) {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    const files = [];
+
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        files.push(...(await this._getFilesRecursive(fullPath)));
+      } else {
+        const stat = await fs.stat(fullPath);
+        files.push({ path: fullPath, size: stat.size });
+      }
+    }
+
+    return files;
+  }
+}
+
+module.exports = StorageManager;

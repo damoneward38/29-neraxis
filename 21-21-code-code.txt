@@ -1,0 +1,18 @@
+🎬 Scene Capture starting...
+
+✅ Captured: Homepage Scene
+   📁 File:    ./captures/2024/01/15/homepage_scene_2024-01-15_14-32-05.png
+   📊 Size:    1.24 MB
+   🔑 Hash:    a3f92bc1d4e507f8...
+   ⏱️  Time:    1847ms
+
+📦 Running batch capture for 3 scenes...
+
+📋 Batch Capture Summary:
+   ✅ Succeeded: 3
+   ❌ Failed:    0
+   ✅ About Page: 856.12 KB
+   ✅ Contact Page: 412.33 KB
+   ✅ Products Page: 2.01 MB
+
+🏁 Scene Capture complete.

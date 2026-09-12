@@ -1,0 +1,204 @@
+/**
+ * Core Scene Capture Engine
+ * Orchestrates screenshot capture, metadata extraction, and storage
+ */
+const puppeteer = require("puppeteer");
+const ImageUtils = require("./utils/imageUtils");
+const MetadataExtractor = require("./MetadataExtractor");
+const StorageManager = require("./StorageManager");
+
+class SceneCapture {
+  /**
+   * @param {object} config - Full application configuration
+   */
+  constructor(config) {
+    this.captureConfig = config.capture;
+    this.storage = new StorageManager(config.storage);
+    this.metadata = new MetadataExtractor(config.metadata);
+    this.storageConfig = config.storage;
+    this.metadataConfig = config.metadata;
+
+    this.browser = null;   // Lazily initialized browser instance
+  }
+
+  /**
+   * Initialize Puppeteer browser (lazy singleton)
+   * @returns {Promise<Browser>} Puppeteer browser instance
+   */
+  async _getBrowser() {
+    if (!this.browser) {
+      this.browser = await puppeteer.launch({
+        headless: "new",                   // Use new headless mode
+        args: [
+          "--no-sandbox",                  // Required for some CI environments
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",       // Prevents memory issues in Docker
+        ],
+        defaultViewport: this.captureConfig.defaultViewport,
+      });
+    }
+    return this.browser;
+  }
+
+  /**
+   * Capture a scene from a URL
+   * @param {string} url - Target URL to capture
+   * @param {string} sceneName - Human-readable name for this scene
+   * @param {object} [options] - Override options for this capture
+   * @param {object} [options.viewport] - { width, height }
+   * @param {string} [options.selector] - CSS selector for element capture
+   * @param {number} [options.delay] - Additional wait time in ms before capture
+   * @returns {Promise<CaptureResult>}
+   */
+  async capture(url, sceneName, options = {}) {
+    const browser = await this._getBrowser();
+    const page = await browser.newPage();
+    const perfStart = Date.now();
+
+    try {
+      // Apply custom viewport if provided
+      if (options.viewport) {
+        await page.setViewport(options.viewport);
+      }
+
+      // Navigate to URL with configurable timeout
+      await page.goto(url, {
+        waitUntil: "networkidle2",         // Wait for network to settle
+        timeout: this.captureConfig.timeout,
+      });
+
+      // Optional: wait additional time for animations/lazy content
+      if (options.delay) {
+        await new Promise((resolve) => setTimeout(resolve, options.delay));
+      }
+
+      // Capture element or full page
+      const screenshotOptions = {
+        type: this.captureConfig.format,
+        quality:
+          this.captureConfig.format !== "png"
+            ? this.captureConfig.quality
+            : undefined,               // quality not supported for PNG
+        fullPage: options.fullPage ?? this.captureConfig.fullPage,
+      };
+
+      let imageBuffer;
+      if (options.selector) {
+        // Capture a specific element by CSS selector
+        const element = await page.$(options.selector);
+        if (!element) {
+          throw new Error(`Selector "${options.selector}" not found on page`);
+        }
+        imageBuffer = await element.screenshot(screenshotOptions);
+      } else {
+        imageBuffer = await page.screenshot(screenshotOptions);
+      }
+
+      const captureTime = Date.now() - perfStart;
+
+      // Generate unique filename
+      const filename = ImageUtils.generateFilename(
+        sceneName,
+        this.captureConfig.format,
+        this.storageConfig.namingPattern
+      );
+
+      // Persist image to disk
+      const filePath = await this.storage.saveImage(imageBuffer, filename);
+
+      // Compute integrity hash
+      const hash = ImageUtils.computeHash(imageBuffer);
+
+      // Build metadata payload
+      const meta = this.metadata.extract({
+        sceneName,
+        filePath,
+        hash,
+        fileSize: imageBuffer.length,
+        viewport: await page.viewport(),
+        performance: {
+          captureTimeMs: captureTime,
+          url,
+        },
+      });
+
+      // Persist metadata if enabled
+      let metaPath = null;
+      if (this.metadataConfig.enabled) {
+        metaPath = await this.storage.saveMetadata(meta, filePath);
+      }
+
+      // Check storage health after capture
+      await this.storage.checkStorageUsage();
+
+      return {
+        success: true,
+        sceneName,
+        filePath,
+        metaPath,
+        hash,
+        size: ImageUtils.formatBytes(imageBuffer.length),
+        captureTimeMs: captureTime,
+        metadata: meta,
+      };
+    } catch (error) {
+      // Structured error response — never throw raw errors to callers
+      return {
+        success: false,
+        sceneName,
+        error: error.message,
+        stack: process.env.NODE_ENV === "development" ? error.stack : undefined,
+      };
+    } finally {
+      // Always close the page to free memory
+      await page.close();
+    }
+  }
+
+  /**
+   * Capture multiple scenes in parallel with concurrency control
+   * @param {Array<{url: string, name: string, options?: object}>} scenes
+   * @param {number} [concurrency=3] - Max parallel captures
+   * @returns {Promise<CaptureResult[]>}
+   */
+  async captureAll(scenes, concurrency = 3) {
+    const results = [];
+
+    // Process in batches to respect concurrency limit
+    for (let i = 0; i < scenes.length; i += concurrency) {
+      const batch = scenes.slice(i, i + concurrency);
+
+      const batchResults = await Promise.allSettled(
+        batch.map(({ url, name, options }) => this.capture(url, name, options))
+      );
+
+      // Normalize settled promises into consistent result objects
+      batchResults.forEach((result, index) => {
+        if (result.status === "fulfilled") {
+          results.push(result.value);
+        } else {
+          results.push({
+            success: false,
+            sceneName: batch[index].name,
+            error: result.reason?.message || "Unknown error",
+          });
+        }
+      });
+    }
+
+    return results;
+  }
+
+  /**
+   * Cleanly shut down the browser instance
+   * @returns {Promise<void>}
+   */
+  async close() {
+    if (this.browser) {
+      await this.browser.close();
+      this.browser = null;
+    }
+  }
+}
+
+module.exports = SceneCapture;

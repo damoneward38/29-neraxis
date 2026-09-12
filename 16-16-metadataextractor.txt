@@ -1,0 +1,78 @@
+/**
+ * Extracts and structures metadata for captured scenes
+ */
+const os = require("os");
+
+class MetadataExtractor {
+  /**
+   * @param {object} config - Metadata configuration section
+   */
+  constructor(config) {
+    this.config = config;
+  }
+
+  /**
+   * Build a complete metadata object for a scene capture
+   * @param {object} options
+   * @param {string} options.sceneName - Scene identifier
+   * @param {string} options.filePath - Saved file path
+   * @param {string} options.hash - Image integrity hash
+   * @param {number} options.fileSize - File size in bytes
+   * @param {object} options.viewport - { width, height }
+   * @param {object} [options.performance] - Performance timing data
+   * @returns {object} Structured metadata
+   */
+  extract({ sceneName, filePath, hash, fileSize, viewport, performance = {} }) {
+    const metadata = {
+      scene: {
+        name: sceneName,
+        capturedAt: new Date().toISOString(),
+        filePath,
+      },
+      file: {
+        hash,                           // MD5 for integrity verification
+        size: fileSize,
+        sizeHuman: this._formatBytes(fileSize),
+      },
+      environment: {
+        platform: os.platform(),
+        nodeVersion: process.version,
+        hostname: os.hostname(),
+      },
+    };
+
+    // Optionally include viewport dimensions
+    if (this.config.includeViewport && viewport) {
+      metadata.viewport = {
+        width: viewport.width,
+        height: viewport.height,
+        aspectRatio: (viewport.width / viewport.height).toFixed(3),
+      };
+    }
+
+    // Optionally include performance timing
+    if (this.config.includePerformance && Object.keys(performance).length) {
+      metadata.performance = performance;
+    }
+
+    return metadata;
+  }
+
+  /**
+   * Internal byte formatter
+   * @param {number} bytes
+   * @returns {string}
+   */
+  _formatBytes(bytes) {
+    const units = ["B", "KB", "MB", "GB"];
+    let value = bytes;
+    let i = 0;
+    while (value >= 1024 && i < units.length - 1) {
+      value /= 1024;
+      i++;
+    }
+    return `${value.toFixed(2)} ${units[i]}`;
+  }
+}
+
+module.exports = MetadataExtractor;

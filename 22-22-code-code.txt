@@ -1,0 +1,7 @@
+mlp_training/
+├── config.py          # Hyperparameters & settings
+├── dataset.py         # Data loading & preprocessing
+├── model.py           # MLP architecture
+├── trainer.py         # Training loop & evaluation
+├── utils.py           # Helpers (metrics, plotting, checkpoints)
+└── main.py            # Entry point

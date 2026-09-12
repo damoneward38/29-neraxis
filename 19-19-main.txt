@@ -1,0 +1,73 @@
+/**
+ * Scene Capture — Entry Point
+ * Demonstrates single and batch capture usage
+ */
+const SceneCapture = require("./src/SceneCapture");
+const config = require("./config/capture.config");
+
+async function main() {
+  const capture = new SceneCapture(config);
+
+  try {
+    console.log("🎬 Scene Capture starting...\n");
+
+    // ── Single Scene Capture ───────────────────────────────────────
+    const result = await capture.capture(
+      "https://example.com",
+      "Homepage Scene",
+      {
+        viewport: { width: 1440, height: 900 },
+        delay: 500,                         // Allow animations to settle
+      }
+    );
+
+    if (result.success) {
+      console.log(`✅ Captured: ${result.sceneName}`);
+      console.log(`   📁 File:    ${result.filePath}`);
+      console.log(`   📊 Size:    ${result.size}`);
+      console.log(`   🔑 Hash:    ${result.hash}`);
+      console.log(`   ⏱️  Time:    ${result.captureTimeMs}ms\n`);
+    } else {
+      console.error(`❌ Failed: ${result.sceneName} — ${result.error}`);
+    }
+
+    // ── Batch Scene Capture ────────────────────────────────────────
+    const scenes = [
+      { url: "https://example.com/about", name: "About Page" },
+      { url: "https://example.com/contact", name: "Contact Page" },
+      {
+        url: "https://example.com/products",
+        name: "Products Page",
+        options: { selector: "#product-grid" },  // Capture specific element
+      },
+    ];
+
+    console.log(`📦 Running batch capture for ${scenes.length} scenes...\n`);
+
+    const batchResults = await capture.captureAll(scenes, 2); // 2 at a time
+
+    // Summary report
+    const succeeded = batchResults.filter((r) => r.success).length;
+    const failed = batchResults.length - succeeded;
+
+    console.log("📋 Batch Capture Summary:");
+    console.log(`   ✅ Succeeded: ${succeeded}`);
+    console.log(`   ❌ Failed:    ${failed}`);
+
+    batchResults.forEach((r) => {
+      const icon = r.success ? "✅" : "❌";
+      const detail = r.success ? r.size : r.error;
+      console.log(`   ${icon} ${r.sceneName}: ${detail}`);
+    });
+  } catch (error) {
+    // Catch any unexpected top-level errors
+    console.error("💥 Fatal error:", error.message);
+    process.exit(1);
+  } finally {
+    // Always release browser resources
+    await capture.close();
+    console.log("\n🏁 Scene Capture complete.");
+  }
+}
+
+main();

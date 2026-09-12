@@ -1,0 +1,54 @@
+"""
+Demo: render a novel view from a known camera pose.
+Run: python demo.py
+"""
+
+import torch
+from novel_view_output import (
+    build_synthesiser,
+    CameraIntrinsics,
+    CameraExtrinsics,
+)
+
+
+def main():
+    # ── Camera setup ──────────────────────────────────────────────────────
+    intrinsics = CameraIntrinsics(
+        fx=800.0, fy=800.0,
+        cx=400.0, cy=300.0,
+        width=800, height=600,
+    )
+
+    # 15° orbit around Y-axis as target pose
+    theta = torch.tensor(0.2618)   # radians
+    R = torch.tensor([
+        [ torch.cos(theta), 0, torch.sin(theta)],
+        [               0., 1,               0.],
+        [-torch.sin(theta), 0, torch.cos(theta)],
+    ])
+    extrinsics = CameraExtrinsics(
+        R=R,
+        t=torch.tensor([0.5, 0.0, -3.0])
+    )
+
+    # ── Build synthesiser ─────────────────────────────────────────────────
+    synth = build_synthesiser(
+        checkpoint_path=None,   # swap in your .pt file
+        num_coarse=64,
+        num_fine=128,
+        chunk_size=2048,
+    )
+
+    # ── Render ────────────────────────────────────────────────────────────
+    output = synth.render(intrinsics, extrinsics)
+
+    # ── Save outputs ──────────────────────────────────────────────────────
+    output.save("./novel_view_outputs", prefix="view_015deg")
+
+    print(f"RGB   shape : {output.rgb.shape}")
+    print(f"Depth shape : {output.depth.shape}")
+    print(f"Opacity min/max: {output.opacity.min():.3f} / {output.opacity.max():.3f}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,90 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import Optional
+
+
+def sinusoidal_positional_encoding(
+    max_seq_len: int,
+    d_model: int,
+    n: int = 10000
+) -> np.ndarray:
+    """
+    Compute sinusoidal positional encoding matrix.
+
+    Args:
+        max_seq_len : Maximum sequence length (number of positions).
+        d_model     : Embedding dimension (must be even).
+        n           : Scaling constant (default 10_000 per original paper).
+
+    Returns:
+        PE matrix of shape (max_seq_len, d_model), dtype float32.
+
+    Raises:
+        ValueError: If d_model is not a positive even integer.
+    """
+    if d_model <= 0 or d_model % 2 != 0:
+        raise ValueError(f"d_model must be a positive even integer, got {d_model}")
+    if max_seq_len <= 0:
+        raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
+
+    # ── Build position & dimension index vectors ──────────────────────────
+    positions = np.arange(max_seq_len)[:, np.newaxis]          # (L, 1)
+    dims      = np.arange(0, d_model, 2)[np.newaxis, :]        # (1, d_model/2)
+
+    # ── Compute the division term (in log-space for numerical stability) ──
+    div_term = np.exp(dims * (-np.log(n) / d_model))            # (1, d_model/2)
+
+    # ── Allocate output and fill even/odd indices ─────────────────────────
+    PE = np.zeros((max_seq_len, d_model), dtype=np.float32)
+    PE[:, 0::2] = np.sin(positions * div_term)                  # even dims → sin
+    PE[:, 1::2] = np.cos(positions * div_term)                  # odd  dims → cos
+
+    return PE
+
+
+def visualize_positional_encoding(
+    PE: np.ndarray,
+    title: str = "Sinusoidal Positional Encoding",
+    figsize: tuple = (14, 6)
+) -> None:
+    """
+    Render a heatmap of the positional encoding matrix.
+
+    Args:
+        PE      : Positional encoding matrix (seq_len, d_model).
+        title   : Plot title.
+        figsize : Matplotlib figure size.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    # ── Heatmap ───────────────────────────────────────────────────────────
+    im = axes[0].imshow(PE, aspect="auto", cmap="RdBu", vmin=-1, vmax=1)
+    axes[0].set_xlabel("Embedding Dimension")
+    axes[0].set_ylabel("Position")
+    axes[0].set_title("PE Heatmap")
+    plt.colorbar(im, ax=axes[0])
+
+    # ── Line plot for selected dimensions ────────────────────────────────
+    for dim in [0, 1, 2, 3, 50, 51]:
+        if dim < PE.shape[1]:
+            label = f"dim {dim} ({'sin' if dim % 2 == 0 else 'cos'})"
+            axes[1].plot(PE[:, dim], label=label, linewidth=1.5)
+
+    axes[1].set_xlabel("Position")
+    axes[1].set_ylabel("Encoding Value")
+    axes[1].set_title("PE Values per Dimension")
+    axes[1].legend(fontsize=8)
+    axes[1].grid(True, alpha=0.3)
+
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    plt.show()
+
+
+# ── Demo ──────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    PE = sinusoidal_positional_encoding(max_seq_len=100, d_model=128)
+    print(f"PE shape : {PE.shape}")          # (100, 128)
+    print(f"PE dtype : {PE.dtype}")          # float32
+    print(f"PE range : [{PE.min():.4f}, {PE.max():.4f}]")
+    visualize_positional_encoding(PE)

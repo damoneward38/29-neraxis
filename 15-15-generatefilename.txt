@@ -1,0 +1,77 @@
+/**
+ * Image utility helpers for scene capture
+ */
+const path = require("path");
+const crypto = require("crypto");
+
+const ImageUtils = {
+  /**
+   * Generate a unique filename based on scene name and timestamp
+   * @param {string} sceneName - Name of the scene
+   * @param {string} format - File extension (png, jpeg, etc.)
+   * @param {string} pattern - Naming pattern from config
+   * @returns {string} Generated filename
+   */
+  generateFilename(sceneName, format = "png", pattern = "{scene}_{timestamp}") {
+    const sanitized = sceneName
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, "_")    // Sanitize special characters
+      .replace(/_+/g, "_")              // Collapse multiple underscores
+      .slice(0, 64);                    // Limit filename length
+
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/[:.]/g, "-")           // Make timestamp filesystem-safe
+      .replace("T", "_")
+      .replace("Z", "");
+
+    return pattern
+      .replace("{scene}", sanitized)
+      .replace("{timestamp}", timestamp)
+      .concat(`.${format}`);
+  },
+
+  /**
+   * Compute MD5 hash of a buffer for integrity checks
+   * @param {Buffer} buffer - Image buffer
+   * @returns {string} MD5 hash string
+   */
+  computeHash(buffer) {
+    return crypto.createHash("md5").update(buffer).digest("hex");
+  },
+
+  /**
+   * Format bytes into human-readable size string
+   * @param {number} bytes - Byte count
+   * @returns {string} Formatted size (e.g., "1.24 MB")
+   */
+  formatBytes(bytes) {
+    const units = ["B", "KB", "MB", "GB"];
+    let value = bytes;
+    let unit = 0;
+
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit++;
+    }
+
+    return `${value.toFixed(2)} ${units[unit]}`;
+  },
+
+  /**
+   * Get MIME type from format string
+   * @param {string} format - File format
+   * @returns {string} MIME type
+   */
+  getMimeType(format) {
+    const mimeMap = {
+      png: "image/png",
+      jpeg: "image/jpeg",
+      jpg: "image/jpeg",
+      webp: "image/webp",
+    };
+    return mimeMap[format.toLowerCase()] || "application/octet-stream";
+  },
+};
+
+module.exports = ImageUtils;

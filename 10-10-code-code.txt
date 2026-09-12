@@ -1,0 +1,5 @@
+1. UNIQUENESS     → Every position gets a unique encoding vector
+2. BOUNDEDNESS    → All values ∈ [-1, 1]  (sin/cos range)
+3. RELATIVE INFO  → PE(pos+k) is a linear function of PE(pos)
+4. GENERALIZATION → Works on sequences longer than those seen in training
+5. DETERMINISTIC  → No randomness; identical every run

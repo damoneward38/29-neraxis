@@ -1,0 +1,119 @@
+import math
+import torch
+import torch.nn as nn
+from torch import Tensor
+
+
+class PositionalEncoding(nn.Module):
+    """
+    Sinusoidal Positional Encoding as a PyTorch Module.
+
+    Injects position information into token embeddings by adding
+    a fixed (non-learnable) sinusoidal signal.
+
+    Args:
+        d_model  : Embedding dimension.
+        max_len  : Maximum sequence length to pre-compute.
+        dropout  : Dropout probability applied after adding PE.
+
+    Shape:
+        Input  : (batch_size, seq_len, d_model)  OR  (seq_len, d_model)
+        Output : Same shape as input.
+
+    Example:
+        >>> pe = PositionalEncoding(d_model=512, max_len=5000, dropout=0.1)
+        >>> x  = torch.randn(32, 64, 512)   # (batch, seq_len, d_model)
+        >>> out = pe(x)                      # (32, 64, 512)
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        max_len: int = 5000,
+        dropout: float = 0.1,
+        n: float = 10_000.0
+    ) -> None:
+        super().__init__()
+
+        # ── Validation ────────────────────────────────────────────────────
+        if d_model <= 0 or d_model % 2 != 0:
+            raise ValueError(f"d_model must be a positive even integer, got {d_model}")
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError(f"dropout must be in [0, 1), got {dropout}")
+
+        self.dropout = nn.Dropout(p=dropout)
+
+        # ── Build PE buffer (not a trainable parameter) ───────────────────
+        PE = self._build_pe(max_len, d_model, n)  # (max_len, d_model)
+
+        # Register as buffer → moves with .to(device), excluded from grads
+        self.register_buffer("PE", PE)
+
+    @staticmethod
+    def _build_pe(max_len: int, d_model: int, n: float) -> Tensor:
+        """Construct the sinusoidal encoding table."""
+        # Position indices: (max_len, 1)
+        position = torch.arange(max_len, dtype=torch.float).unsqueeze(1)
+
+        # Dimension scaling: (d_model/2,)  — log-space for numerical stability
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float)
+            * (-math.log(n) / d_model)
+        )
+
+        PE = torch.zeros(max_len, d_model)
+        PE[:, 0::2] = torch.sin(position * div_term)   # even → sin
+        PE[:, 1::2] = torch.cos(position * div_term)   # odd  → cos
+
+        return PE  # (max_len, d_model)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Add positional encoding to input embeddings.
+
+        Args:
+            x : Token embeddings of shape (batch, seq_len, d_model)
+                or (seq_len, d_model).
+
+        Returns:
+            Tensor of same shape with positional information added.
+        """
+        # Support both batched (3-D) and unbatched (2-D) inputs
+        seq_len = x.size(-2)
+
+        if seq_len > self.PE.size(0):  # type: ignore[attr-defined]
+            raise ValueError(
+                f"Sequence length {seq_len} exceeds max_len "
+                f"{self.PE.size(0)}. Re-instantiate with a larger max_len."
+            )
+
+        # Slice the pre-computed PE to match current seq_len, then broadcast
+        x = x + self.PE[:seq_len]   # PE auto-broadcasts over batch dim
+
+        return self.dropout(x)
+
+    def extra_repr(self) -> str:
+        return (
+            f"d_model={self.PE.size(1)}, "    # type: ignore[attr-defined]
+            f"max_len={self.PE.size(0)}, "
+            f"dropout={self.dropout.p}"
+        )
+
+
+# ── Demo ──────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    torch.manual_seed(42)
+
+    d_model, seq_len, batch = 512, 64, 32
+
+    pe  = PositionalEncoding(d_model=d_model, max_len=5000, dropout=0.1)
+    x   = torch.randn(batch, seq_len, d_model)
+    out = pe(x)
+
+    print(pe)
+    print(f"Input  shape : {x.shape}")    # (32, 64, 512)
+    print(f"Output shape : {out.shape}")  # (32, 64, 512)
+
+    # Verify PE has no gradients
+    assert not pe.PE.requires_grad, "PE should not be trainable"
+    print("✅ PE is correctly registered as a non-trainable buffer")

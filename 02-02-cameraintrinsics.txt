@@ -1,0 +1,603 @@
+"""
+Novel View Synthesis Output Pipeline
+DeepCode AI - Production Ready Implementation
+Supports: NeRF-style rendering, point cloud projection, depth-based warping
+"""
+
+import os
+import torch
+import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, List, Dict, Union
+from pathlib import Path
+import logging
+
+# ── Logging Configuration ────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+logger = logging.getLogger("NovelViewOutput")
+
+
+# ── Data Structures ──────────────────────────────────────────────────────────
+
+@dataclass
+class CameraIntrinsics:
+    """Pinhole camera intrinsic parameters."""
+    fx: float          # Focal length X
+    fy: float          # Focal length Y
+    cx: float          # Principal point X
+    cy: float          # Principal point Y
+    width: int         # Image width  (px)
+    height: int        # Image height (px)
+
+    @property
+    def K(self) -> torch.Tensor:
+        """Return 3×3 intrinsic matrix."""
+        return torch.tensor([
+            [self.fx,    0.0, self.cx],
+            [   0.0, self.fy, self.cy],
+            [   0.0,    0.0,    1.0 ]
+        ], dtype=torch.float32)
+
+
+@dataclass
+class CameraExtrinsics:
+    """Camera pose in world space (R | t)."""
+    R: torch.Tensor    # (3, 3) rotation matrix
+    t: torch.Tensor    # (3,)   translation vector
+
+    @property
+    def c2w(self) -> torch.Tensor:
+        """Camera-to-world 4×4 transform."""
+        mat = torch.eye(4, dtype=torch.float32)
+        mat[:3, :3] = self.R
+        mat[:3,  3] = self.t
+        return mat
+
+    @property
+    def w2c(self) -> torch.Tensor:
+        """World-to-camera 4×4 transform."""
+        return torch.linalg.inv(self.c2w)
+
+
+@dataclass
+class RenderConfig:
+    """Rendering hyper-parameters."""
+    near_plane:      float = 0.1
+    far_plane:       float = 100.0
+    num_coarse:      int   = 64        # Coarse ray samples
+    num_fine:        int   = 128       # Fine ray samples (hierarchical)
+    chunk_size:      int   = 4096      # Rays per forward pass (VRAM budget)
+    white_background: bool = True
+    device:          str   = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+@dataclass
+class NovelViewOutput:
+    """
+    Final output container for a synthesized novel view.
+    All tensors are float32, range [0, 1].
+    """
+    rgb:        torch.Tensor                   # (H, W, 3)  rendered color
+    depth:      torch.Tensor                   # (H, W)     expected depth
+    opacity:    torch.Tensor                   # (H, W)     accumulated opacity
+    weights:    Optional[torch.Tensor] = None  # (H, W, N)  per-sample weights
+    extras:     Dict[str, torch.Tensor] = field(default_factory=dict)
+
+    def to_numpy(self) -> Dict[str, np.ndarray]:
+        """Convert all tensors to uint8 / float32 numpy arrays."""
+        return {
+            "rgb":     (self.rgb.cpu().numpy() * 255).astype(np.uint8),
+            "depth":   self.depth.cpu().numpy().astype(np.float32),
+            "opacity": self.opacity.cpu().numpy().astype(np.float32),
+        }
+
+    def save(self, out_dir: Union[str, Path], prefix: str = "novel_view") -> None:
+        """Persist output images to disk (requires Pillow)."""
+        try:
+            from PIL import Image
+        except ImportError:
+            raise ImportError("Install Pillow: pip install Pillow")
+
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        arrays = self.to_numpy()
+
+        # ── RGB ──────────────────────────────────────────────────────────────
+        Image.fromarray(arrays["rgb"]).save(out_dir / f"{prefix}_rgb.png")
+
+        # ── Depth (normalised to 8-bit for quick preview) ────────────────────
+        d = arrays["depth"]
+        d_norm = ((d - d.min()) / (d.max() - d.min() + 1e-8) * 255).astype(np.uint8)
+        Image.fromarray(d_norm, mode="L").save(out_dir / f"{prefix}_depth.png")
+
+        # ── Opacity ──────────────────────────────────────────────────────────
+        o = (arrays["opacity"] * 255).astype(np.uint8)
+        Image.fromarray(o, mode="L").save(out_dir / f"{prefix}_opacity.png")
+
+        logger.info(f"Saved novel view outputs → {out_dir}")
+
+
+# ── Positional Encoding ──────────────────────────────────────────────────────
+
+class PositionalEncoding(nn.Module):
+    """
+    Fourier feature positional encoding (NeRF-style).
+    Maps R^d → R^(2*L*d + d) via sin/cos at multiple frequencies.
+    """
+
+    def __init__(self, num_freqs: int = 10, include_input: bool = True):
+        super().__init__()
+        self.num_freqs     = num_freqs
+        self.include_input = include_input
+        # Precompute frequency bands: [2^0, 2^1, …, 2^(L-1)] * π
+        freqs = 2.0 ** torch.linspace(0, num_freqs - 1, num_freqs) * torch.pi
+        self.register_buffer("freqs", freqs)
+
+    @property
+    def out_dim(self) -> int:
+        base = 3 if self.include_input else 0  # assumes 3-D input
+        return base + 2 * self.num_freqs * 3
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (..., 3) input coordinates
+        Returns:
+            encoded: (..., out_dim) positional features
+        """
+        parts = [x] if self.include_input else []
+        for freq in self.freqs:
+            parts.append(torch.sin(freq * x))
+            parts.append(torch.cos(freq * x))
+        return torch.cat(parts, dim=-1)
+
+
+# ── NeRF MLP ─────────────────────────────────────────────────────────────────
+
+class NeRFMLP(nn.Module):
+    """
+    Compact NeRF MLP: (γ(x), γ(d)) → (RGB, σ).
+    Uses skip connection at layer 4 (original NeRF architecture).
+    """
+
+    def __init__(
+        self,
+        pos_enc_freqs: int = 10,
+        dir_enc_freqs: int = 4,
+        hidden_dim:    int = 256,
+        num_layers:    int = 8,
+        skip_at:       int = 4,
+    ):
+        super().__init__()
+        self.pos_enc = PositionalEncoding(pos_enc_freqs)
+        self.dir_enc = PositionalEncoding(dir_enc_freqs)
+        self.skip_at = skip_at
+
+        in_dim  = self.pos_enc.out_dim
+        dir_dim = self.dir_enc.out_dim
+
+        # ── Density (σ) trunk ─────────────────────────────────────────────
+        self.density_layers = nn.ModuleList()
+        for i in range(num_layers):
+            layer_in = in_dim if i == 0 else hidden_dim
+            if i == skip_at:
+                layer_in += in_dim   # skip connection re-injects encoded pos
+            self.density_layers.append(nn.Linear(layer_in, hidden_dim))
+
+        self.density_out = nn.Linear(hidden_dim, 1)       # raw σ
+        self.feature_out = nn.Linear(hidden_dim, hidden_dim)
+
+        # ── Color (c) head ────────────────────────────────────────────────
+        self.color_layers = nn.Sequential(
+            nn.Linear(hidden_dim + dir_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim // 2, 3),
+            nn.Sigmoid(),                                  # RGB ∈ [0, 1]
+        )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Xavier uniform for linear layers; zero bias."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        pts: torch.Tensor,   # (N, 3) 3-D sample positions
+        dirs: torch.Tensor,  # (N, 3) normalised view directions
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            rgb:   (N, 3) colour prediction
+            sigma: (N,)   volume density (before activation)
+        """
+        enc_pts  = self.pos_enc(pts)   # (N, pos_enc_dim)
+        enc_dirs = self.dir_enc(dirs)  # (N, dir_enc_dim)
+
+        h = enc_pts
+        for i, layer in enumerate(self.density_layers):
+            if i == self.skip_at:
+                h = torch.cat([h, enc_pts], dim=-1)   # skip connection
+            h = F.relu(layer(h), inplace=True)
+
+        sigma   = self.density_out(h).squeeze(-1)     # raw density
+        feature = self.feature_out(h)
+
+        rgb = self.color_layers(torch.cat([feature, enc_dirs], dim=-1))
+        return rgb, sigma
+
+
+# ── Ray Generation ───────────────────────────────────────────────────────────
+
+class RayGenerator:
+    """Generates rays from camera parameters."""
+
+    @staticmethod
+    def generate_rays(
+        intrinsics:  CameraIntrinsics,
+        extrinsics:  CameraExtrinsics,
+        device:      str = "cpu",
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generates per-pixel ray origins and directions in world space.
+
+        Returns:
+            origins:    (H*W, 3) ray origin (camera centre, world coords)
+            directions: (H*W, 3) unit ray direction (world coords)
+        """
+        H, W = intrinsics.height, intrinsics.width
+        K    = intrinsics.K.to(device)
+        c2w  = extrinsics.c2w.to(device)
+
+        # ── Pixel grid ────────────────────────────────────────────────────
+        i, j = torch.meshgrid(
+            torch.arange(W, dtype=torch.float32, device=device),
+            torch.arange(H, dtype=torch.float32, device=device),
+            indexing="xy",
+        )
+
+        # ── Unproject to camera space ─────────────────────────────────────
+        dirs_cam = torch.stack([
+            (i - K[0, 2]) / K[0, 0],   # x
+            (j - K[1, 2]) / K[1, 1],   # y  (OpenCV: y down)
+            torch.ones_like(i),         # z
+        ], dim=-1)                      # (H, W, 3)
+
+        # ── Rotate to world space ─────────────────────────────────────────
+        R_w = c2w[:3, :3]                             # (3, 3)
+        dirs_world = (dirs_cam @ R_w.T).reshape(-1, 3)
+        dirs_world = F.normalize(dirs_world, dim=-1)  # ensure unit length
+
+        # ── Origin = camera translation ───────────────────────────────────
+        origins = c2w[:3, 3].unsqueeze(0).expand(H * W, -1)
+
+        return origins, dirs_world
+
+    @staticmethod
+    def sample_along_rays(
+        origins:    torch.Tensor,  # (N, 3)
+        directions: torch.Tensor,  # (N, 3)
+        near:       float,
+        far:        float,
+        num_samples: int,
+        randomize:  bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Stratified sampling of points along each ray.
+
+        Returns:
+            pts:      (N, S, 3) 3-D sample points
+            z_vals:   (N, S)    depth values
+        """
+        N = origins.shape[0]
+        device = origins.device
+
+        # Uniform bins in [near, far]
+        t = torch.linspace(near, far, num_samples, device=device)  # (S,)
+        t = t.unsqueeze(0).expand(N, -1)                           # (N, S)
+
+        if randomize:
+            # Add uniform jitter within each bin
+            mids  = 0.5 * (t[:, 1:] + t[:, :-1])
+            upper = torch.cat([mids, t[:, -1:]], dim=-1)
+            lower = torch.cat([t[:, :1], mids],  dim=-1)
+            rand  = torch.rand_like(t)
+            t     = lower + rand * (upper - lower)
+
+        # r(t) = o + t * d
+        pts = origins[:, None, :] + t[:, :, None] * directions[:, None, :]
+        return pts, t
+
+
+# ── Volume Renderer ───────────────────────────────────────────────────────────
+
+class VolumeRenderer:
+    """
+    Classic NeRF volume rendering:
+    C(r) = Σ T_i · α_i · c_i
+    where T_i = exp(-Σ_{j<i} σ_j δ_j), α_i = 1 - exp(-σ_i δ_i)
+    """
+
+    @staticmethod
+    def render(
+        rgb_samples:   torch.Tensor,  # (N, S, 3)
+        sigma_samples: torch.Tensor,  # (N, S)
+        z_vals:        torch.Tensor,  # (N, S)
+        dirs:          torch.Tensor,  # (N, 3)   unused here, kept for API parity
+        white_bg:      bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Composite samples → final pixel values.
+
+        Returns dict with keys: rgb, depth, opacity, weights
+        """
+        device = rgb_samples.device
+
+        # ── Segment lengths δ_i ───────────────────────────────────────────
+        dists = z_vals[:, 1:] - z_vals[:, :-1]                    # (N, S-1)
+        # Append a large value for the last segment
+        dists = torch.cat([dists, torch.full_like(dists[:, :1], 1e10)], dim=-1)
+
+        # ── Alpha = 1 - exp(-σ·δ) ─────────────────────────────────────────
+        alpha = 1.0 - torch.exp(-F.relu(sigma_samples) * dists)   # (N, S)
+
+        # ── Transmittance T_i = Π_{j<i}(1 - α_j) ────────────────────────
+        T = torch.cumprod(
+            torch.cat([torch.ones_like(alpha[:, :1]),
+                       1.0 - alpha[:, :-1] + 1e-10], dim=-1),
+            dim=-1
+        )                                                           # (N, S)
+
+        weights = T * alpha                                         # (N, S)
+
+        # ── Composite colour ──────────────────────────────────────────────
+        rgb     = (weights[..., None] * rgb_samples).sum(dim=1)    # (N, 3)
+
+        # ── Expected depth ────────────────────────────────────────────────
+        depth   = (weights * z_vals).sum(dim=-1)                   # (N,)
+
+        # ── Opacity (accumulated alpha) ───────────────────────────────────
+        opacity = weights.sum(dim=-1)                              # (N,)
+
+        if white_bg:
+            rgb = rgb + (1.0 - opacity[..., None])   # composite on white
+
+        return {
+            "rgb":     rgb.clamp(0, 1),
+            "depth":   depth,
+            "opacity": opacity.clamp(0, 1),
+            "weights": weights,
+        }
+
+
+# ── Novel View Synthesiser ────────────────────────────────────────────────────
+
+class NovelViewSynthesiser:
+    """
+    End-to-end novel view synthesis engine.
+
+    Usage:
+        synth  = NovelViewSynthesiser(model, config)
+        output = synth.render(intrinsics, extrinsics)
+        output.save("./outputs")
+    """
+
+    def __init__(self, model: NeRFMLP, config: RenderConfig):
+        self.model   = model.to(config.device).eval()
+        self.config  = config
+        self.ray_gen = RayGenerator()
+        self.renderer = VolumeRenderer()
+        logger.info(f"NovelViewSynthesiser ready | device={config.device}")
+
+    @torch.no_grad()
+    def render(
+        self,
+        intrinsics:  CameraIntrinsics,
+        extrinsics:  CameraExtrinsics,
+        randomize:   bool = False,   # deterministic at test time
+    ) -> NovelViewOutput:
+        """
+        Render a full novel view image.
+
+        Args:
+            intrinsics:  target camera intrinsics
+            extrinsics:  target camera pose
+            randomize:   whether to use stratified jitter
+
+        Returns:
+            NovelViewOutput with rgb, depth, opacity
+        """
+        cfg    = self.config
+        H, W   = intrinsics.height, intrinsics.width
+        device = cfg.device
+
+        # ── 1. Generate all rays ──────────────────────────────────────────
+        origins, dirs = self.ray_gen.generate_rays(intrinsics, extrinsics, device)
+        N = origins.shape[0]   # H * W
+
+        all_rgb     = torch.zeros(N, 3,  device=device)
+        all_depth   = torch.zeros(N,     device=device)
+        all_opacity = torch.zeros(N,     device=device)
+
+        # ── 2. Process in chunks (VRAM friendly) ─────────────────────────
+        for start in range(0, N, cfg.chunk_size):
+            end  = min(start + cfg.chunk_size, N)
+            o_ch = origins[start:end]
+            d_ch = dirs[start:end]
+
+            chunk_out = self._render_chunk(o_ch, d_ch, randomize)
+
+            all_rgb    [start:end] = chunk_out["rgb"]
+            all_depth  [start:end] = chunk_out["depth"]
+            all_opacity[start:end] = chunk_out["opacity"]
+
+        # ── 3. Reshape flat arrays → image tensors ────────────────────────
+        rgb_img     = all_rgb    .reshape(H, W, 3)
+        depth_img   = all_depth  .reshape(H, W)
+        opacity_img = all_opacity.reshape(H, W)
+
+        logger.info(f"Rendered novel view | size=({H}×{W}) | device={device}")
+
+        return NovelViewOutput(
+            rgb=rgb_img,
+            depth=depth_img,
+            opacity=opacity_img,
+        )
+
+    def _render_chunk(
+        self,
+        origins: torch.Tensor,   # (chunk, 3)
+        dirs:    torch.Tensor,   # (chunk, 3)
+        randomize: bool,
+    ) -> Dict[str, torch.Tensor]:
+        """Sample + query MLP + volume render for one ray chunk."""
+        cfg = self.config
+
+        # ── Coarse sampling ───────────────────────────────────────────────
+        pts, z_vals = self.ray_gen.sample_along_rays(
+            origins, dirs,
+            near=cfg.near_plane,
+            far=cfg.far_plane,
+            num_samples=cfg.num_coarse,
+            randomize=randomize,
+        )
+
+        N, S, _ = pts.shape
+        flat_pts  = pts.reshape(-1, 3)
+        flat_dirs = dirs[:, None, :].expand(N, S, 3).reshape(-1, 3)
+
+        rgb_c, sigma_c = self.model(flat_pts, flat_dirs)
+        rgb_c   = rgb_c  .reshape(N, S, 3)
+        sigma_c = sigma_c.reshape(N, S)
+
+        out_c = self.renderer.render(
+            rgb_c, sigma_c, z_vals, dirs,
+            white_bg=cfg.white_background
+        )
+
+        # ── Fine (hierarchical) sampling ──────────────────────────────────
+        if cfg.num_fine > 0:
+            z_vals_f = self._importance_sample(
+                z_vals, out_c["weights"], cfg.num_fine
+            )
+
+            pts_f, _ = self.ray_gen.sample_along_rays(
+                origins, dirs,
+                near=cfg.near_plane,
+                far=cfg.far_plane,
+                num_samples=cfg.num_fine,
+                randomize=randomize,
+            )
+
+            # Merge coarse + fine z values and re-sort
+            z_vals_combined, idx = torch.sort(
+                torch.cat([z_vals, z_vals_f], dim=-1), dim=-1
+            )
+            pts_combined = (
+                origins[:, None, :] +
+                z_vals_combined[:, :, None] * dirs[:, None, :]
+            )
+
+            Nf = z_vals_combined.shape[1]
+            flat_pts_f  = pts_combined.reshape(-1, 3)
+            flat_dirs_f = dirs[:, None, :].expand(N, Nf, 3).reshape(-1, 3)
+
+            rgb_f, sigma_f = self.model(flat_pts_f, flat_dirs_f)
+            rgb_f   = rgb_f  .reshape(N, Nf, 3)
+            sigma_f = sigma_f.reshape(N, Nf)
+
+            out = self.renderer.render(
+                rgb_f, sigma_f, z_vals_combined, dirs,
+                white_bg=cfg.white_background
+            )
+            return out
+
+        return out_c
+
+    @staticmethod
+    def _importance_sample(
+        z_vals:  torch.Tensor,   # (N, S)
+        weights: torch.Tensor,   # (N, S)
+        num_fine: int,
+    ) -> torch.Tensor:
+        """
+        Sample new z values proportional to coarse weights (PDF sampling).
+
+        Returns:
+            z_fine: (N, num_fine) importance-sampled depths
+        """
+        # Build PDF from weights (add small ε for numerical stability)
+        weights_pdf = weights + 1e-5
+        pdf = weights_pdf / weights_pdf.sum(dim=-1, keepdim=True)
+        cdf = torch.cumsum(pdf, dim=-1)
+        cdf = torch.cat([torch.zeros_like(cdf[:, :1]), cdf], dim=-1)
+
+        # Uniform samples for inversion
+        u = torch.rand(
+            (z_vals.shape[0], num_fine),
+            device=z_vals.device,
+            dtype=z_vals.dtype
+        )
+        u = u.contiguous()
+
+        # Invert CDF
+        inds = torch.searchsorted(cdf.contiguous(), u, right=True)
+        below = (inds - 1).clamp(min=0)
+        above = inds.clamp(max=cdf.shape[-1] - 1)
+
+        cdf_below = torch.gather(cdf,    1, below)
+        cdf_above = torch.gather(cdf,    1, above)
+        t_below   = torch.gather(z_vals, 1, below)
+        t_above   = torch.gather(z_vals, 1, above)
+
+        denom = (cdf_above - cdf_below).clamp(min=1e-5)
+        t_mid = t_below + (u - cdf_below) / denom * (t_above - t_below)
+
+        return t_mid
+
+
+# ── Factory / Builder ─────────────────────────────────────────────────────────
+
+def build_synthesiser(
+    checkpoint_path: Optional[str] = None,
+    device:          str = "auto",
+    **kwargs,
+) -> NovelViewSynthesiser:
+    """
+    Factory to build a ready-to-use NovelViewSynthesiser.
+
+    Args:
+        checkpoint_path: path to a saved model state dict (.pt / .pth)
+        device:          'auto' | 'cuda' | 'cpu'
+        **kwargs:        overrides for RenderConfig fields
+
+    Returns:
+        Configured NovelViewSynthesiser instance
+    """
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    config = RenderConfig(device=device, **kwargs)
+    model  = NeRFMLP()
+
+    if checkpoint_path:
+        ckpt_path = Path(checkpoint_path)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        state = torch.load(ckpt_path, map_location=device)
+        # Support both raw state_dict and wrapped checkpoints
+        state = state.get("model_state_dict", state)
+        model.load_state_dict(state)
+        logger.info(f"Loaded checkpoint: {ckpt_path}")
+    else:
+        logger.warning("No checkpoint provided — using random weights (demo mode)")
+
+    return NovelViewSynthesiser(model, config)

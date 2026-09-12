@@ -1,0 +1,10 @@
+scene-capture/
+├── src/
+│   ├── SceneCapture.js
+│   ├── MetadataExtractor.js
+│   ├── StorageManager.js
+│   └── utils/
+│       └── imageUtils.js
+├── config/
+│   └── capture.config.js
+└── index.js

@@ -1,0 +1,2 @@
+Input tokens  →  Token Embedding  →  × √d_model  →  + Positional Encoding  →  Transformer
+                  (learned)            (scale)          (fixed or learned)

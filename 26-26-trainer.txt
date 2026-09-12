@@ -1,0 +1,268 @@
+# trainer.py
+import os
+import time
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    StepLR,
+    ReduceLROnPlateau,
+    LinearLR,
+    SequentialLR,
+)
+from typing import Dict, Optional, Tuple
+from config import MLPConfig
+from model import MLP
+
+
+class Trainer:
+    """
+    Full training / evaluation engine for MLP.
+
+    Supports:
+        - Mixed-precision training (AMP)
+        - Gradient clipping
+        - LR warmup + scheduling
+        - Early stopping
+        - Best-model checkpointing
+        - Per-epoch metric logging
+    """
+
+    def __init__(
+        self,
+        model: MLP,
+        config: MLPConfig,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+    ):
+        self.model  = model
+        self.config = config
+        self.train_loader = train_loader
+        self.val_loader   = val_loader
+        self.device       = self._resolve_device(config.device)
+
+        self.model.to(self.device)
+
+        # ── Optimizer ─────────────────────────────────────────────
+        self.optimizer = AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+
+        # ── Loss ──────────────────────────────────────────────────
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+        # ── Scheduler ─────────────────────────────────────────────
+        self.scheduler = self._build_scheduler()
+
+        # ── Mixed precision ───────────────────────────────────────
+        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.device.type == "cuda"))
+
+        # ── Tracking ──────────────────────────────────────────────
+        self.history: Dict[str, list] = {
+            "train_loss": [], "train_acc": [],
+            "val_loss":   [], "val_acc":   [],
+            "lr":         [],
+        }
+        self.best_val_loss    = float("inf")
+        self.patience_counter = 0
+
+        os.makedirs(config.checkpoint_dir, exist_ok=True)
+
+    # ── Device resolution ─────────────────────────────────────────────────────
+    @staticmethod
+    def _resolve_device(device_str: str) -> torch.device:
+        if device_str == "auto":
+            if torch.cuda.is_available():
+                return torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                return torch.device("mps")
+            return torch.device("cpu")
+        return torch.device(device_str)
+
+    # ── Scheduler builder ─────────────────────────────────────────────────────
+    def _build_scheduler(self):
+        cfg = self.config
+        total_steps = cfg.epochs
+
+        main_schedulers = {
+            "cosine":  CosineAnnealingLR(self.optimizer, T_max=total_steps - cfg.warmup_epochs),
+            "step":    StepLR(self.optimizer, step_size=cfg.step_size, gamma=cfg.gamma),
+            "plateau": ReduceLROnPlateau(self.optimizer, factor=cfg.gamma, patience=5, verbose=True),
+            "none":    None,
+        }
+
+        if cfg.scheduler not in main_schedulers:
+            raise ValueError(f"Unknown scheduler '{cfg.scheduler}'.")
+
+        main_sched = main_schedulers[cfg.scheduler]
+
+        # Wrap with linear warmup (skip for plateau/none)
+        if cfg.warmup_epochs > 0 and main_sched and cfg.scheduler != "plateau":
+            warmup = LinearLR(
+                self.optimizer,
+                start_factor=1e-3,
+                end_factor=1.0,
+                total_iters=cfg.warmup_epochs,
+            )
+            return SequentialLR(
+                self.optimizer,
+                schedulers=[warmup, main_sched],
+                milestones=[cfg.warmup_epochs],
+            )
+
+        return main_sched
+
+    # ── Single training epoch ─────────────────────────────────────────────────
+    def _train_epoch(self, epoch: int) -> Tuple[float, float]:
+        self.model.train()
+        total_loss, correct, total = 0.0, 0, 0
+
+        for batch_idx, (inputs, targets) in enumerate(self.train_loader):
+            inputs, targets = inputs.to(self.device), targets.to(self.device)
+
+            self.optimizer.zero_grad(set_to_none=True)  # slightly faster than zero_grad()
+
+            # Forward with AMP
+            with torch.cuda.amp.autocast(enabled=(self.device.type == "cuda")):
+                logits = self.model(inputs)
+                loss   = self.criterion(logits, targets)
+
+            # Backward + gradient clipping
+            self.scaler.scale(loss).backward()
+
+            if self.config.grad_clip > 0:
+                self.scaler.unscale_(self.optimizer)
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            # Accumulate metrics
+            total_loss += loss.item() * inputs.size(0)
+            preds       = logits.argmax(dim=1)
+            correct    += preds.eq(targets).sum().item()
+            total      += inputs.size(0)
+
+            # Batch-level logging
+            if (batch_idx + 1) % self.config.log_interval == 0:
+                avg_loss = total_loss / total
+                acc      = 100.0 * correct / total
+                print(
+                    f"  [Epoch {epoch:03d}] Batch {batch_idx+1:04d}/{len(self.train_loader):04d} "
+                    f"| Loss: {avg_loss:.4f} | Acc: {acc:.2f}%"
+                )
+
+        return total_loss / total, 100.0 * correct / total
+
+    # ── Evaluation ────────────────────────────────────────────────────────────
+    @torch.no_grad()
+    def _evaluate(self, loader: DataLoader) -> Tuple[float, float]:
+        self.model.eval()
+        total_loss, correct, total = 0.0, 0, 0
+
+        for inputs, targets in loader:
+            inputs, targets = inputs.to(self.device), targets.to(self.device)
+
+            with torch.cuda.amp.autocast(enabled=(self.device.type == "cuda")):
+                logits = self.model(inputs)
+                loss   = self.criterion(logits, targets)
+
+            total_loss += loss.item() * inputs.size(0)
+            correct    += logits.argmax(dim=1).eq(targets).sum().item()
+            total      += inputs.size(0)
+
+        return total_loss / total, 100.0 * correct / total
+
+    # ── Checkpointing ─────────────────────────────────────────────────────────
+    def _save_checkpoint(self, epoch: int, val_loss: float, tag: str = "best") -> None:
+        path = os.path.join(self.config.checkpoint_dir, f"mlp_{tag}.pt")
+        torch.save(
+            {
+                "epoch":       epoch,
+                "model_state": self.model.state_dict(),
+                "optim_state": self.optimizer.state_dict(),
+                "val_loss":    val_loss,
+                "config":      self.config,
+            },
+            path,
+        )
+        print(f"  ✅ Checkpoint saved → {path}")
+
+    def load_checkpoint(self, path: str) -> int:
+        """Load a checkpoint and return the saved epoch number."""
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model_state"])
+        self.optimizer.load_state_dict(ckpt["optim_state"])
+        print(f"  📂 Loaded checkpoint from epoch {ckpt['epoch']} (val_loss={ckpt['val_loss']:.4f})")
+        return ckpt["epoch"]
+
+    # ── Main training loop ────────────────────────────────────────────────────
+    def train(self) -> Dict[str, list]:
+        """
+        Run the full training loop.
+
+        Returns:
+            history dict with train/val loss and accuracy per epoch.
+        """
+        print(f"\n{'='*60}")
+        print(f"  Training MLP on {self.device}")
+        print(f"  Parameters: {self.model.count_parameters():,}")
+        print(f"  Epochs: {self.config.epochs} | Batch: {self.config.batch_size}")
+        print(f"{'='*60}\n")
+
+        for epoch in range(1, self.config.epochs + 1):
+            start = time.time()
+
+            # ── Train ──────────────────────────────────────────
+            train_loss, train_acc = self._train_epoch(epoch)
+
+            # ── Validate ───────────────────────────────────────
+            val_loss, val_acc = self._evaluate(self.val_loader)
+
+            # ── Scheduler step ────────────────────────────────
+            if self.scheduler is not None:
+                if isinstance(self.scheduler, ReduceLROnPlateau):
+                    self.scheduler.step(val_loss)
+                else:
+                    self.scheduler.step()
+
+            current_lr = self.optimizer.param_groups[0]["lr"]
+            elapsed    = time.time() - start
+
+            # ── Log epoch summary ─────────────────────────────
+            print(
+                f"Epoch [{epoch:03d}/{self.config.epochs}] "
+                f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}% | "
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}% | "
+                f"LR: {current_lr:.2e} | Time: {elapsed:.1f}s"
+            )
+
+            # ── History ───────────────────────────────────────
+            self.history["train_loss"].append(train_loss)
+            self.history["train_acc"].append(train_acc)
+            self.history["val_loss"].append(val_loss)
+            self.history["val_acc"].append(val_acc)
+            self.history["lr"].append(current_lr)
+
+            # ── Best model checkpoint ─────────────────────────
+            if val_loss < self.best_val_loss:
+                self.best_val_loss    = val_loss
+                self.patience_counter = 0
+                self._save_checkpoint(epoch, val_loss, tag="best")
+            else:
+                self.patience_counter += 1
+
+            # ── Early stopping ────────────────────────────────
+            if (
+                self.config.early_stopping_patience > 0
+                and self.patience_counter >= self.config.early_stopping_patience
+            ):
+                print(f"\n⏹  Early stopping triggered at epoch {epoch}.")
+                break
+
+        print(f"\n✅ Training complete. Best val loss: {self.best_val_loss:.4f}")
+        return self.history

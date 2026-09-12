@@ -1,0 +1,6 @@
+Token:     [The]     [cat]     [sat]     [on]      [mat]
+Position:    0         1         2         3          4
+             ↓         ↓         ↓         ↓          ↓
+PE Vector: [sin,cos] [sin,cos] [sin,cos] [sin,cos] [sin,cos]
+             ↓         ↓         ↓         ↓          ↓
+Embedding: x₀ + PE₀  x₁ + PE₁  x₂ + PE₂  x₃ + PE₃  x₄ + PE₄

@@ -1,0 +1,120 @@
+# model.py
+import torch
+import torch.nn as nn
+from typing import List, Optional
+from config import MLPConfig
+
+
+# ── Activation factory ────────────────────────────────────────────────────────
+ACTIVATIONS = {
+    "relu":       nn.ReLU,
+    "gelu":       nn.GELU,
+    "leaky_relu": nn.LeakyReLU,
+    "tanh":       nn.Tanh,
+    "silu":       nn.SiLU,
+}
+
+
+def get_activation(name: str) -> nn.Module:
+    """Return an activation module by name (case-insensitive)."""
+    key = name.lower()
+    if key not in ACTIVATIONS:
+        raise ValueError(f"Unknown activation '{name}'. Choose from: {list(ACTIVATIONS)}")
+    return ACTIVATIONS[key]()
+
+
+# ── Single hidden block ───────────────────────────────────────────────────────
+class MLPBlock(nn.Module):
+    """
+    One hidden layer:  Linear → [BatchNorm] → Activation → [Dropout]
+    BatchNorm is placed BEFORE activation (common best practice).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        activation: str = "relu",
+        dropout_rate: float = 0.0,
+        use_batch_norm: bool = True,
+    ):
+        super().__init__()
+
+        layers: List[nn.Module] = [nn.Linear(in_features, out_features)]
+
+        if use_batch_norm:
+            layers.append(nn.BatchNorm1d(out_features))
+
+        layers.append(get_activation(activation))
+
+        if dropout_rate > 0.0:
+            layers.append(nn.Dropout(p=dropout_rate))
+
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+# ── Full MLP ──────────────────────────────────────────────────────────────────
+class MLP(nn.Module):
+    """
+    Flexible Multi-Layer Perceptron.
+
+    Architecture:
+        Input → [MLPBlock × N] → Linear (output) → (optional LogSoftmax)
+
+    Args:
+        config: MLPConfig instance carrying all architecture hyperparameters.
+    """
+
+    def __init__(self, config: MLPConfig):
+        super().__init__()
+        self.config = config
+
+        dims = [config.input_dim] + config.hidden_dims  # layer dimensions
+
+        # Build hidden blocks
+        hidden_layers = [
+            MLPBlock(
+                in_features=dims[i],
+                out_features=dims[i + 1],
+                activation=config.activation,
+                dropout_rate=config.dropout_rate,
+                use_batch_norm=config.use_batch_norm,
+            )
+            for i in range(len(dims) - 1)
+        ]
+        self.hidden = nn.Sequential(*hidden_layers)
+
+        # Output projection (no activation — handled by loss function)
+        self.output = nn.Linear(config.hidden_dims[-1], config.output_dim)
+
+        # Weight initialisation
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Kaiming uniform for Linear layers; ones/zeros for BatchNorm."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_uniform_(module.weight, nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm1d):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch_size, input_dim) — already flattened.
+        Returns:
+            logits: (batch_size, output_dim)
+        """
+        x = x.view(x.size(0), -1)   # flatten if needed
+        x = self.hidden(x)
+        return self.output(x)
+
+    def count_parameters(self) -> int:
+        """Return total number of trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)

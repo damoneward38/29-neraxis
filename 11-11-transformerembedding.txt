@@ -1,0 +1,36 @@
+class TransformerEmbedding(nn.Module):
+    """
+    Token Embedding + Positional Encoding combined layer.
+    Used as the input stage of a Transformer encoder/decoder.
+    """
+
+    def __init__(
+        self,
+        vocab_size : int,
+        d_model    : int,
+        max_len    : int = 5000,
+        dropout    : float = 0.1,
+        padding_idx: Optional[int] = None
+    ) -> None:
+        super().__init__()
+
+        # ── Token embedding ───────────────────────────────────────────────
+        self.token_emb = nn.Embedding(vocab_size, d_model, padding_idx=padding_idx)
+
+        # ── Positional encoding ───────────────────────────────────────────
+        self.pos_enc = PositionalEncoding(d_model=d_model, max_len=max_len, dropout=dropout)
+
+        # Scale embeddings by √d_model (original paper, Section 3.4)
+        self.scale = math.sqrt(d_model)
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        """
+        Args:
+            token_ids : (batch_size, seq_len) — integer token IDs
+
+        Returns:
+            (batch_size, seq_len, d_model) — combined embedding
+        """
+        # Scale then add positional encoding
+        x = self.token_emb(token_ids) * self.scale
+        return self.pos_enc(x)

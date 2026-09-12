@@ -1,0 +1,53 @@
+# main.py
+from config import MLPConfig
+from dataset import load_datasets
+from model import MLP
+from trainer import Trainer
+from utils import set_seed, plot_training_history, evaluate_model
+
+
+def main():
+    # ── 1. Config ──────────────────────────────────────────────────
+    config = MLPConfig(
+        dataset       = "mnist",
+        input_dim     = 784,         # 28×28
+        hidden_dims   = [512, 256, 128],
+        output_dim    = 10,
+        dropout_rate  = 0.3,
+        use_batch_norm= True,
+        activation    = "relu",
+        epochs        = 30,
+        batch_size    = 128,
+        learning_rate = 1e-3,
+        weight_decay  = 1e-4,
+        scheduler     = "cosine",
+        warmup_epochs = 3,
+        early_stopping_patience = 8,
+        seed          = 42,
+    )
+
+    # ── 2. Reproducibility ─────────────────────────────────────────
+    set_seed(config.seed)
+
+    # ── 3. Data ────────────────────────────────────────────────────
+    train_loader, val_loader, test_loader = load_datasets(config)
+
+    # ── 4. Model ───────────────────────────────────────────────────
+    model = MLP(config)
+    print(model)
+
+    # ── 5. Train ───────────────────────────────────────────────────
+    trainer = Trainer(model, config, train_loader, val_loader)
+    history = trainer.train()
+
+    # ── 6. Visualize ───────────────────────────────────────────────
+    plot_training_history(history, save_dir=config.log_dir)
+
+    # ── 7. Test evaluation ─────────────────────────────────────────
+    device      = trainer.device
+    class_names = [str(i) for i in range(config.output_dim)]
+    evaluate_model(model, test_loader, device, class_names)
+
+
+if __name__ == "__main__":
+    main()

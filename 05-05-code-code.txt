@@ -1,0 +1,4 @@
+novel_view_outputs/
+├── view_015deg_rgb.png       # Synthesised colour image
+├── view_015deg_depth.png     # Normalised depth map (greyscale)
+└── view_015deg_opacity.png   # Accumulated opacity mask
