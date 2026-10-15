@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<link rel="icon" href="data:,">
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Neraxis — Neural 3D Agent</title>
@@ -53,6 +54,7 @@ input[type=range]{width:100%;accent-color:var(--accent);margin-bottom:12px}
     <button class="nav-tab" onclick="showTab('cap')">Scene Capture</button>
     <button class="nav-tab" onclick="showTab('mlp')">MLP Trainer</button>
   </nav>
+<div role="note" style="margin:8px 14px;padding:8px 12px;background:#1c1930;color:#ddd6fe;border:1px solid #4c3c75;border-radius:8px;font-size:11px">INTERACTIVE DEMO: scene rendering, capture counters, and MLP training controls are browser-side simulations; no external scene dataset or trained model is connected.</div>
   <div id="view">
     <div class="tab active" id="tab-nf">
       <div id="nf-main">
